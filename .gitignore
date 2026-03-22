@@ -1,4 +1,6 @@
-venv/
-experiments/
 __pycache__/
+*.py[cod]
 .ipynb_checkpoints/
+.venv/
+venv/
+ai-talent-hub-itmo-speech-course/ai-talent-hub-itmo-speech-course/

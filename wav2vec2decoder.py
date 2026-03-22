@@ -1,8 +1,10 @@
 from typing import List, Tuple
-
+import collections
+import math
 import kenlm
 import torch
 import torchaudio
+import torch.nn.functional as F
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 
 
@@ -13,7 +15,8 @@ class Wav2Vec2Decoder:
             lm_model_path="lm/3-gram.pruned.1e-7.arpa.gz",
             beam_width=3,
             alpha=1.0,
-            beta=1.0
+            beta=1.0,
+            temperature=1.0,
         ):
         """
         Initialization of Wav2Vec2Decoder class
@@ -36,6 +39,7 @@ class Wav2Vec2Decoder:
         self.beam_width = beam_width
         self.alpha = alpha
         self.beta = beta
+        self.temperature = temperature
         self.lm_model = kenlm.Model(lm_model_path) if lm_model_path else None
 
     def greedy_decode(self, logits: torch.Tensor) -> str:
@@ -48,8 +52,9 @@ class Wav2Vec2Decoder:
         Returns:
             str: Decoded transcript
         """
-        # <YOUR CODE GOES HERE>
-        return
+        logits = logits / self.temperature
+        predicted_ids = torch.argmax(logits, dim=-1)[0].tolist()
+        return self._decode_path(predicted_ids)
 
     def beam_search_decode(self, logits: torch.Tensor, return_beams: bool = False):
         """
@@ -67,12 +72,106 @@ class Wav2Vec2Decoder:
                 (List[Tuple[List[int], float]]) - If return_beams is True, returns a list of tuples
                     containing hypotheses and log probabilities.
         """
-        # <YOUR CODE GOES HERE>
-        if return_beams:
-            return beams
-        else:
-            return best_hypothesis
+        NEG_INF = -float("inf")
 
+        def make_new_beam():
+            return collections.defaultdict(lambda: (NEG_INF, NEG_INF))
+
+        def logsumexp(*args):
+            if all(a == NEG_INF for a in args):
+                return NEG_INF
+            a_max = max(args)
+            return a_max + math.log(sum(math.exp(a - a_max) for a in args))
+
+        probs = logits[0] / self.temperature
+        probs = F.softmax(probs, dim=-1)
+        T, S = probs.shape
+        probs = torch.log(probs + 1e-10)
+
+        beam = [(tuple(), (0.0, NEG_INF))]
+
+        for t in range(T):
+            next_beam = make_new_beam()
+
+            for s in range(S):
+                p = probs[t, s].item()
+
+                for prefix, (p_b, p_nb) in beam:
+                    if s == self.blank_token_id:
+                        # пересчитываем вероятности для бланка
+                        n_p_b, n_p_nb = next_beam[prefix]
+                        n_p_b = logsumexp(n_p_b, p_b + p, p_nb + p)
+                        next_beam[prefix] = (n_p_b, n_p_nb)
+                        continue
+
+                    # дополняем новым символом
+                    end_t = prefix[-1] if prefix else None
+                    n_prefix = prefix + (s,)
+                    n_p_b, n_p_nb = next_beam[n_prefix]
+
+                    # пересчитываем вероятности
+                    if s != end_t:
+                        n_p_nb = logsumexp(n_p_nb, p_b + p, p_nb + p)
+                    else:
+                        n_p_nb = logsumexp(n_p_nb, p_b + p)
+
+                    next_beam[n_prefix] = (n_p_b, n_p_nb)
+
+                    if s == end_t:
+                        n_p_b, n_p_nb = next_beam[prefix]
+                        n_p_nb = logsumexp(n_p_nb, p_nb + p)
+                        next_beam[prefix] = (n_p_b, n_p_nb)
+
+            beam = sorted(
+                next_beam.items(),
+                key=lambda x: logsumexp(*x[1]),
+                reverse=True
+            )[:self.beam_width]
+
+        if return_beams:
+            return [(list(path), logsumexp(*scores)) for path, scores in beam]
+        else:
+            best_prefix, best_scores = beam[0]
+            return self._decode_prefix(best_prefix)
+
+    def _decode_path(self, path) -> str:
+        string_list = []
+        word_list = []
+
+        for i in range(len(path)):
+            if path[i] == self.blank_token_id:
+                continue
+            if i != 0 and path[i] == path[i - 1]:
+                continue
+            if self.vocab[path[i]] != self.word_delimiter:
+                word_list.append(self.vocab[path[i]])
+            else:
+                string_list.append(''.join(word_list))
+                word_list = []
+
+        if word_list:
+            string_list.append(''.join(word_list))
+
+        return ' '.join(string_list).lower().strip()
+
+    def _decode_prefix(self, path) -> str:
+        string_list = []
+        word_list = []
+
+        for c in path:
+            if c == self.blank_token_id:
+                continue
+            if self.vocab[c] != self.word_delimiter:
+                word_list.append(self.vocab[c])
+            else:
+                string_list.append(''.join(word_list))
+                word_list = []
+
+        if word_list:
+            string_list.append(''.join(word_list))
+
+        return ' '.join(string_list).lower().strip()
+    
     def beam_search_with_lm(self, logits: torch.Tensor) -> str:
         """
         Perform beam search decoding with shallow LM fusion

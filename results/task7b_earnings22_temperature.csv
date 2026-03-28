@@ -1,0 +1,9 @@
+Method,Temperature,WER,CER,time_sec
+Greedy,0.5,54.97,25.58,70.7
+Beam + 10-gram (shallow fusion),0.5,55.18,25.56,217.95
+Greedy,1.0,54.97,25.58,70.77
+Beam + 10-gram (shallow fusion),1.0,55.36,25.43,213.84
+Greedy,1.5,54.97,25.58,71.68
+Beam + 10-gram (shallow fusion),1.5,56.17,25.56,222.62
+Greedy,2.0,54.97,25.58,78.96
+Beam + 10-gram (shallow fusion),2.0,57.71,25.81,215.4

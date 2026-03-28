@@ -1,17 +1,17 @@
 from typing import List, Tuple
 import collections
+import heapq
 import math
 import kenlm
 import torch
 import torchaudio
-import torch.nn.functional as F
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 
 
 class Wav2Vec2Decoder:
     def __init__(
             self,
-            model_name="facebook/wav2vec2-base-960h",
+            model_name="facebook/wav2vec2-base-100h",
             lm_model_path="lm/3-gram.pruned.1e-7.arpa.gz",
             beam_width=3,
             alpha=1.0,
@@ -42,28 +42,42 @@ class Wav2Vec2Decoder:
         self.temperature = temperature
         self.lm_model = kenlm.Model(lm_model_path) if lm_model_path else None
 
-    def greedy_decode(self, logits: torch.Tensor) -> str:
+    def _select_top_beams(self, scored_hypotheses):
+        top_hypotheses = []
+
+        for idx, (score, hypothesis) in enumerate(scored_hypotheses):
+            entry = (score, idx, hypothesis)
+            if len(top_hypotheses) < self.beam_width:
+                heapq.heappush(top_hypotheses, entry)
+            else:
+                heapq.heappushpop(top_hypotheses, entry)
+
+        top_hypotheses.sort(key=lambda x: x[0], reverse=True)
+        return [hypothesis for _, _, hypothesis in top_hypotheses]
+        
+    def greedy_decode(self, scores: torch.Tensor) -> str:
         """
         Perform greedy decoding (find best CTC path)
         
         Args:
-            logits (torch.Tensor): Logits from Wav2Vec2 model (T, V)
+            scores (torch.Tensor): Acoustic model outputs with shape (T, V) or (1, T, V)
         
         Returns:
             str: Decoded transcript
         """
-        logits = logits / self.temperature
-        predicted_ids = torch.argmax(logits, dim=-1)[0].tolist()
+        if scores.ndim == 3:
+            scores = scores[0]
+
+        predicted_ids = torch.argmax(scores, dim=-1).tolist()
         return self._decode_path(predicted_ids)
 
-    def beam_search_decode(self, logits: torch.Tensor, return_beams: bool = False):
+    def beam_search_decode(self, scores: torch.Tensor, return_beams: bool = False):
         """
         Perform beam search decoding (no LM)
         
         Args:
-            logits (torch.Tensor): Logits from Wav2Vec2 model (T, V), where
-                T - number of time steps and
-                V - vocabulary size
+            scores (torch.Tensor): Log probabilities from Wav2Vec2 model (T, V) or (1, T, V),
+                where T - number of time steps and V - vocabulary size
             return_beams (bool): Return all beam hypotheses for second pass LM rescoring
         
         Returns:
@@ -83,10 +97,8 @@ class Wav2Vec2Decoder:
             a_max = max(args)
             return a_max + math.log(sum(math.exp(a - a_max) for a in args))
 
-        probs = logits[0] / self.temperature
-        probs = F.softmax(probs, dim=-1)
-        T, S = probs.shape
-        probs = torch.log(probs + 1e-10)
+        log_probs = scores[0] if scores.ndim == 3 else scores
+        T, S = log_probs.shape
 
         beam = [(tuple(), (0.0, NEG_INF))]
 
@@ -94,7 +106,7 @@ class Wav2Vec2Decoder:
             next_beam = make_new_beam()
 
             for s in range(S):
-                p = probs[t, s].item()
+                p = log_probs[t, s].item()
 
                 for prefix, (p_b, p_nb) in beam:
                     if s == self.blank_token_id:
@@ -122,11 +134,10 @@ class Wav2Vec2Decoder:
                         n_p_nb = logsumexp(n_p_nb, p_nb + p)
                         next_beam[prefix] = (n_p_b, n_p_nb)
 
-            beam = sorted(
-                next_beam.items(),
-                key=lambda x: logsumexp(*x[1]),
-                reverse=True
-            )[:self.beam_width]
+            beam = self._select_top_beams(
+                (logsumexp(*scores), (path, scores))
+                for path, scores in next_beam.items()
+            )
 
         if return_beams:
             return [(list(path), logsumexp(*scores)) for path, scores in beam]
@@ -172,23 +183,100 @@ class Wav2Vec2Decoder:
 
         return ' '.join(string_list).lower().strip()
     
-    def beam_search_with_lm(self, logits: torch.Tensor) -> str:
-        """
-        Perform beam search decoding with shallow LM fusion
-        
-        Args:
-            logits (torch.Tensor): Logits from Wav2Vec2 model (T, V), where
-                T - number of time steps and
-                V - vocabulary size
-        
-        Returns:
-            str: Decoded transcript
-        """
+    def beam_search_with_lm(self, scores: torch.Tensor) -> str:
         if not self.lm_model:
             raise ValueError("KenLM model required for LM shallow fusion")
-        
-        # <YOUR CODE GOES HERE>
-        return
+
+        NEG_INF = -float("inf")
+
+        def make_new_beam():
+            return collections.defaultdict(lambda: (NEG_INF, NEG_INF))
+
+        def logsumexp(*args):
+            if all(a == NEG_INF for a in args):
+                return NEG_INF
+            a_max = max(args)
+            return a_max + math.log(sum(math.exp(a - a_max) for a in args))
+
+        text_cache = {}
+        lm_score_cache = {}
+        word_count_cache = {}
+
+        def get_text(prefix):
+            if prefix in text_cache:
+                return text_cache[prefix]
+
+            text_cache[prefix] = self._decode_prefix(prefix).lower().strip()
+            return text_cache[prefix]
+
+        def get_lm_score(prefix):
+            if prefix in lm_score_cache:
+                return lm_score_cache[prefix]
+
+            text = get_text(prefix)
+
+            if not text:
+                return 0.0
+
+            score = self.lm_model.score(text, bos=True, eos=False) * math.log(10)
+            lm_score_cache[prefix] = score
+            return score
+
+        def get_word_count(prefix):
+            if prefix in word_count_cache:
+                return word_count_cache[prefix]
+
+            text = get_text(prefix)
+
+            count = len(text.split()) if text else 0
+            word_count_cache[prefix] = count
+            return count
+
+        log_probs = scores[0] if scores.ndim == 3 else scores
+        T, S = log_probs.shape
+
+        beam = [(tuple(), (0.0, NEG_INF))]
+
+        for t in range(T):
+            next_beam = make_new_beam()
+
+            for s in range(S):
+                p = log_probs[t, s].item()
+
+                for prefix, (p_b, p_nb) in beam:
+                    if s == self.blank_token_id:
+                        n_p_b, n_p_nb = next_beam[prefix]
+                        n_p_b = logsumexp(n_p_b, p_b + p, p_nb + p)
+                        next_beam[prefix] = (n_p_b, n_p_nb)
+                        continue
+
+                    end_t = prefix[-1] if prefix else None
+                    n_prefix = prefix + (s,)
+                    n_p_b, n_p_nb = next_beam[n_prefix]
+
+                    if s != end_t:
+                        n_p_nb = logsumexp(n_p_nb, p_b + p, p_nb + p)
+                    else:
+                        n_p_nb = logsumexp(n_p_nb, p_b + p)
+
+                    next_beam[n_prefix] = (n_p_b, n_p_nb)
+
+                    if s == end_t:
+                        n_p_b, n_p_nb = next_beam[prefix]
+                        n_p_nb = logsumexp(n_p_nb, p_nb + p)
+                        next_beam[prefix] = (n_p_b, n_p_nb)
+
+            beam = self._select_top_beams(
+                (
+                    logsumexp(*scores) + self.alpha * get_lm_score(path) + self.beta * get_word_count(path),
+                    (path, scores),
+                )
+                for path, scores in next_beam.items()
+            )
+
+        best_prefix, _ = beam[0]
+        return self._decode_prefix(best_prefix)
+
 
     def lm_rescore(self, beams: List[Tuple[List[int], float]]) -> str:
         """
@@ -202,8 +290,22 @@ class Wav2Vec2Decoder:
         """
         if not self.lm_model:
             raise ValueError("KenLM model required for LM rescoring")
-        # <YOUR CODE GOES HERE>
-        return
+        best_score = -float("inf")
+        best_text = ""
+
+        for path, acoustic_score in beams:
+            text = self._decode_prefix(path).lower().strip()
+            if not text:
+                continue
+            lm_score = self.lm_model.score(text, bos=True, eos=False) * math.log(10)
+            word_count = len(text.split())
+            total = acoustic_score + self.alpha * lm_score + self.beta * word_count
+
+            if total > best_score:
+                best_score = total
+                best_text = text
+
+        return best_text
 
     def decode(self, audio_input: torch.Tensor, method: str = "greedy") -> str:
         """
@@ -220,18 +322,23 @@ class Wav2Vec2Decoder:
         Returns:
             str: Decoded transcription
         """
+        if isinstance(audio_input, torch.Tensor):
+            audio_input = audio_input.squeeze().cpu().numpy()
+
         inputs = self.processor(audio_input, return_tensors="pt", sampling_rate=16000)
         with torch.no_grad():
-            logits = self.model(inputs.input_values.squeeze(0)).logits[0]
+            logits = self.model(**inputs).logits[0]
+            logits = logits / self.temperature
+            log_probs = torch.log_softmax(logits, dim=-1)
 
         if method == "greedy":
-            return self.greedy_decode(logits)
+            return self.greedy_decode(log_probs)
         elif method == "beam":
-            return self.beam_search_decode(logits)
+            return self.beam_search_decode(log_probs)
         elif method == "beam_lm":
-            return self.beam_search_with_lm(logits)
+            return self.beam_search_with_lm(log_probs)
         elif method == "beam_lm_rescore":
-            beams = self.beam_search_decode(logits, return_beams=True)
+            beams = self.beam_search_decode(log_probs, return_beams=True)
             return self.lm_rescore(beams)
         else:
             raise ValueError("Invalid decoding method. Choose one of 'greedy', 'beam', 'beam_lm', 'beam_lm_rescore'.")

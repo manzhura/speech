@@ -1,5 +1,0 @@
-Dataset,LM,WER,CER,time_sec
-LibriSpeech,LibriSpeech 3-gram,11.1,3.76,131.62
-LibriSpeech,Financial 3-gram,11.83,3.86,129.74
-Earnings22,LibriSpeech 3-gram,55.21,25.38,107.88
-Earnings22,Financial 3-gram,52.95,25.05,110.4
